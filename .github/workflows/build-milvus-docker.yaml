@@ -1,0 +1,308 @@
+name: Build Milvus Docker Image
+
+on:
+  push:
+    branches:
+      - master
+      - main
+      - develop
+    tags:
+      - 'v*'
+      - 'release-*'
+  workflow_dispatch:  # 保留手动触发
+    inputs:
+      image_tag:
+        description: '镜像标签'
+        required: false
+        default: 'latest'
+        type: string
+      os_name:
+        description: '操作系统版本'
+        required: false
+        default: 'ubuntu20.04'
+        type: choice
+        options:
+          - ubuntu20.04
+          - ubuntu22.04
+          - amazonlinux2023
+          - rockylinux8
+      push_to_registry:
+        description: '是否推送到镜像仓库'
+        required: false
+        default: true
+        type: boolean
+
+env:
+  # 镜像仓库配置 - 可以修改为你的个人仓库
+  # 格式：registry.example.com/username/milvus 或 username/milvus (Docker Hub)
+  MILVUS_IMAGE_REPO: milvusdb/milvus
+  OS_NAME: ${{ inputs.os_name || 'ubuntu20.04' }}
+  MILVUS_IMAGE_TAG: ${{ inputs.image_tag || github.ref_name || 'latest' }}
+
+jobs:
+  build-milvus-binary:
+    name: 编译 Milvus 二进制文件
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - name: 确定构建信息
+        id: build-info
+        run: |
+          # 根据触发方式确定镜像标签
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            IMAGE_TAG="${{ inputs.image_tag }}"
+            OS_NAME="${{ inputs.os_name }}"
+            PUSH_ENABLED="${{ inputs.push_to_registry }}"
+          elif [[ "${{ github.ref }}" == refs/tags/* ]]; then
+            # 打标签触发：使用标签名作为镜像标签，自动推送
+            IMAGE_TAG="${{ github.ref_name }}"
+            OS_NAME="ubuntu20.04"
+            PUSH_ENABLED="true"
+          else
+            # 推送代码触发：使用分支名-日期-短commit，自动推送
+            BRANCH_NAME=$(echo "${{ github.ref_name }}" | sed 's/\//-/g')
+            SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
+            IMAGE_TAG="${BRANCH_NAME}-$(date +%Y%m%d)-${SHORT_SHA}"
+            OS_NAME="ubuntu20.04"
+            PUSH_ENABLED="true"
+          fi
+          
+          echo "image_tag=${IMAGE_TAG}" >> $GITHUB_OUTPUT
+          echo "os_name=${OS_NAME}" >> $GITHUB_OUTPUT
+          echo "push_enabled=${PUSH_ENABLED}" >> $GITHUB_OUTPUT
+          
+          echo "📦 构建信息:"
+          echo "  - 镜像标签: ${IMAGE_TAG}"
+          echo "  - 操作系统: ${OS_NAME}"
+          echo "  - 触发方式: ${{ github.event_name }}"
+          echo "  - 分支/标签: ${{ github.ref_name }}"
+          echo "  - 推送镜像: ${PUSH_ENABLED}"
+
+      - name: 设置 HOME 环境变量
+        run: |
+          if [ -z "$HOME" ]; then
+            echo "HOME=/home/runner" >> $GITHUB_ENV
+          fi
+          echo "HOME=$HOME"
+
+      - name: 设置 mold 链接器
+        uses: rui314/setup-mold@v1
+
+      - name: 最大化构建空间
+        uses: easimon/maximize-build-space@master
+        with:
+          root-reserve-mb: 20480
+          swap-size-mb: 1024
+          remove-dotnet: 'true'
+          remove-android: 'true'
+          remove-haskell: 'true'
+
+      - name: Checkout 代码
+        uses: actions/checkout@v2
+        with:
+          fetch-depth: 0
+
+      - name: 下载构建缓存
+        uses: ./.github/actions/cache-restore
+        with:
+          os: 'ubuntu22.04'
+          kind: 'cpp'
+
+      - name: 编译 C++ 代码
+        run: |
+          ./build/builder.sh /bin/bash -c "make build-cpp && chmod -R a+rwx /home/milvus/.conan"
+
+      - name: 下载 Go 构建缓存
+        uses: ./.github/actions/cache-restore
+        with:
+          os: 'ubuntu22.04'
+          kind: 'go'
+
+      - name: 编译 Go 代码
+        run: |
+          ./build/builder.sh /bin/bash -c "make build-go"
+
+      - name: 打包编译产物
+        run: |
+          # 打包二进制文件、库文件和配置文件
+          mkdir -p artifacts
+          cp -r bin artifacts/
+          cp -r lib artifacts/
+          cp -r configs artifacts/
+          tar -czf milvus-build-artifacts.tar.gz -C artifacts .
+
+      - name: 上传编译产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: milvus-build-artifacts
+          path: milvus-build-artifacts.tar.gz
+          retention-days: 1
+    
+    outputs:
+      image_tag: ${{ steps.build-info.outputs.image_tag }}
+      os_name: ${{ steps.build-info.outputs.os_name }}
+      push_enabled: ${{ steps.build-info.outputs.push_enabled }}
+
+  build-docker-image:
+    name: 构建 Docker 镜像
+    needs: build-milvus-binary
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout 代码
+        uses: actions/checkout@v2
+
+      - name: 下载编译产物
+        uses: actions/download-artifact@v4
+        with:
+          name: milvus-build-artifacts
+
+      - name: 解压编译产物
+        run: |
+          tar -xzf milvus-build-artifacts.tar.gz
+          ls -lah bin/
+          ls -lah lib/
+          ls -lah configs/
+
+      - name: 设置 Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      
+      - name: 登录到镜像仓库
+        if: needs.build-milvus-binary.outputs.push_enabled == 'true'
+        uses: docker/login-action@v3
+        with:
+          # Docker Hub 登录（如果是 Docker Hub）
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+          
+          # 如果是其他镜像仓库，取消下面的注释并配置
+          # registry: registry.example.com
+          # username: ${{ secrets.REGISTRY_USERNAME }}
+          # password: ${{ secrets.REGISTRY_PASSWORD }}
+
+      - name: 设置构建参数
+        id: build-args
+        run: |
+          IMAGE_ARCH="amd64"
+          BUILD_ARGS="--build-arg TARGETARCH=${IMAGE_ARCH}"
+          
+          echo "build_args=${BUILD_ARGS}" >> $GITHUB_OUTPUT
+          echo "image_arch=${IMAGE_ARCH}" >> $GITHUB_OUTPUT
+
+      - name: 构建 Docker 镜像
+        run: |
+          IMAGE_TAG="${{ needs.build-milvus-binary.outputs.image_tag }}"
+          OS_NAME="${{ needs.build-milvus-binary.outputs.os_name }}"
+          
+          docker build \
+            --network host \
+            ${{ steps.build-args.outputs.build_args }} \
+            --platform linux/${{ steps.build-args.outputs.image_arch }} \
+            -f "./build/docker/milvus/${OS_NAME}/Dockerfile" \
+            -t "${{ env.MILVUS_IMAGE_REPO }}:${IMAGE_TAG}" \
+            .
+          
+          echo "FINAL_IMAGE_TAG=${IMAGE_TAG}" >> $GITHUB_ENV
+          echo "FINAL_OS_NAME=${OS_NAME}" >> $GITHUB_ENV
+
+      - name: 检查镜像信息
+        run: |
+          IMAGE_TAG="${{ env.FINAL_IMAGE_TAG }}"
+          OS_NAME="${{ env.FINAL_OS_NAME }}"
+          PUSH_ENABLED="${{ needs.build-milvus-binary.outputs.push_enabled }}"
+          
+          echo "=========================================="
+          echo "✅ Docker 镜像构建成功！"
+          echo "=========================================="
+          echo "镜像名称: ${{ env.MILVUS_IMAGE_REPO }}:${IMAGE_TAG}"
+          echo "操作系统: ${OS_NAME}"
+          echo "架构: ${{ steps.build-args.outputs.image_arch }}"
+          echo "触发方式: ${{ github.event_name }}"
+          echo "分支/标签: ${{ github.ref_name }}"
+          echo "推送镜像: ${PUSH_ENABLED}"
+          echo ""
+          
+          # 显示镜像大小
+          image_size=$(docker inspect ${{ env.MILVUS_IMAGE_REPO }}:${IMAGE_TAG} -f '{{.Size}}' | awk '{ byte =$1 /1024/1024/1024; print byte " GB" }')
+          echo "镜像大小: ${image_size}"
+          echo ""
+          
+          # 显示镜像详细信息
+          echo "镜像详细信息:"
+          docker images ${{ env.MILVUS_IMAGE_REPO }}:${IMAGE_TAG}
+          echo ""
+          
+          # 测试镜像是否可以运行
+          echo "测试镜像启动..."
+          docker run --rm ${{ env.MILVUS_IMAGE_REPO }}:${IMAGE_TAG} milvus --version || echo "版本检查完成"
+      
+      - name: 推送镜像到仓库
+        if: needs.build-milvus-binary.outputs.push_enabled == 'true'
+        run: |
+          IMAGE_TAG="${{ env.FINAL_IMAGE_TAG }}"
+          
+          echo "🚀 开始推送镜像到仓库..."
+          docker push ${{ env.MILVUS_IMAGE_REPO }}:${IMAGE_TAG}
+          
+          echo "✅ 镜像推送成功！"
+          echo "镜像地址: ${{ env.MILVUS_IMAGE_REPO }}:${IMAGE_TAG}"
+
+      - name: 导出镜像为 tar 文件
+        run: |
+          IMAGE_TAG="${{ env.FINAL_IMAGE_TAG }}"
+          docker save ${{ env.MILVUS_IMAGE_REPO }}:${IMAGE_TAG} -o milvus-docker-image.tar
+          gzip milvus-docker-image.tar
+
+      - name: 上传镜像文件
+        uses: actions/upload-artifact@v4
+        with:
+          name: milvus-docker-image-${{ env.FINAL_IMAGE_TAG }}
+          path: milvus-docker-image.tar.gz
+          retention-days: 7
+      
+      - name: 生成构建摘要
+        run: |
+          IMAGE_TAG="${{ env.FINAL_IMAGE_TAG }}"
+          OS_NAME="${{ env.FINAL_OS_NAME }}"
+          PUSH_ENABLED="${{ needs.build-milvus-binary.outputs.push_enabled }}"
+          
+          echo "## 🎉 Milvus Docker 镜像构建完成" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 📋 构建信息" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| 项目 | 值 |" >> $GITHUB_STEP_SUMMARY
+          echo "|------|-----|" >> $GITHUB_STEP_SUMMARY
+          echo "| 镜像标签 | \`${{ env.MILVUS_IMAGE_REPO }}:${IMAGE_TAG}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| 操作系统 | ${OS_NAME} |" >> $GITHUB_STEP_SUMMARY
+          echo "| 架构 | ${{ steps.build-args.outputs.image_arch }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| 触发方式 | ${{ github.event_name }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| 分支/标签 | ${{ github.ref_name }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Commit | \`${{ github.sha }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| 已推送 | ${PUSH_ENABLED} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          if [ "${PUSH_ENABLED}" = "true" ]; then
+            echo "### 🚀 拉取镜像" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "\`\`\`bash" >> $GITHUB_STEP_SUMMARY
+            echo "docker pull ${{ env.MILVUS_IMAGE_REPO }}:${IMAGE_TAG}" >> $GITHUB_STEP_SUMMARY
+            echo "docker run -d ${{ env.MILVUS_IMAGE_REPO }}:${IMAGE_TAG}" >> $GITHUB_STEP_SUMMARY
+            echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          echo "### 📦 下载镜像文件" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "镜像已打包上传为 Artifact，可在本页面下载 \`milvus-docker-image-${IMAGE_TAG}.tar.gz\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "下载后解压并加载镜像：" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`bash" >> $GITHUB_STEP_SUMMARY
+          echo "# 解压" >> $GITHUB_STEP_SUMMARY
+          echo "gunzip milvus-docker-image.tar.gz" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "# 加载到 Docker" >> $GITHUB_STEP_SUMMARY
+          echo "docker load -i milvus-docker-image.tar" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "# 运行" >> $GITHUB_STEP_SUMMARY
+          echo "docker run -d ${{ env.MILVUS_IMAGE_REPO }}:${IMAGE_TAG}" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
