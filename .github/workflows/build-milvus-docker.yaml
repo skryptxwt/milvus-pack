@@ -78,6 +78,30 @@ jobs:
           echo "  - 分支/标签: ${{ github.ref_name }}"
           echo "  - 推送镜像: ${PUSH_ENABLED}"
 
+      - name: 清理磁盘空间
+        run: |
+          echo "清理前磁盘空间:"
+          df -h
+          
+          echo "开始清理不必要的文件..."
+          
+          # 删除不需要的软件和工具
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          sudo rm -rf "$AGENT_TOOLSDIRECTORY"
+          
+          # 清理 apt 缓存
+          sudo apt-get clean
+          sudo apt-get autoremove -y
+          
+          # 清理 Docker 缓存
+          docker system prune -af --volumes || true
+          
+          echo "清理后磁盘空间:"
+          df -h
+
       - name: 设置 HOME 环境变量
         run: |
           if [ -z "$HOME" ]; then
@@ -87,15 +111,6 @@ jobs:
 
       - name: 设置 mold 链接器
         uses: rui314/setup-mold@v1
-
-      - name: 最大化构建空间
-        uses: easimon/maximize-build-space@master
-        with:
-          root-reserve-mb: 20480
-          swap-size-mb: 1024
-          remove-dotnet: 'true'
-          remove-android: 'true'
-          remove-haskell: 'true'
 
       - name: Checkout 代码
         uses: actions/checkout@v2
@@ -110,7 +125,22 @@ jobs:
 
       - name: 编译 C++ 代码
         run: |
+          echo "编译前磁盘空间:"
+          df -h
+          
           ./build/builder.sh /bin/bash -c "make build-cpp && chmod -R a+rwx /home/milvus/.conan"
+          
+          echo "编译后磁盘空间:"
+          df -h
+      
+      - name: 清理编译缓存
+        run: |
+          echo "清理编译产生的临时文件..."
+          # 清理 Docker 构建缓存
+          docker builder prune -af || true
+          
+          echo "清理后磁盘空间:"
+          df -h
 
       - name: 下载 Go 构建缓存
         uses: ./.github/actions/cache-restore
@@ -121,6 +151,9 @@ jobs:
       - name: 编译 Go 代码
         run: |
           ./build/builder.sh /bin/bash -c "make build-go"
+          
+          echo "Go 编译后磁盘空间:"
+          df -h
 
       - name: 打包编译产物
         run: |
@@ -130,6 +163,12 @@ jobs:
           cp -r lib artifacts/
           cp -r configs artifacts/
           tar -czf milvus-build-artifacts.tar.gz -C artifacts .
+          
+          # 清理不需要的文件以节省空间
+          rm -rf artifacts
+          
+          echo "打包后磁盘空间:"
+          df -h
 
       - name: 上传编译产物
         uses: actions/upload-artifact@v4
@@ -149,6 +188,30 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
+      - name: 清理磁盘空间
+        run: |
+          echo "清理前磁盘空间:"
+          df -h
+          
+          echo "开始清理不必要的文件..."
+          
+          # 删除不需要的软件和工具
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          sudo rm -rf "$AGENT_TOOLSDIRECTORY"
+          
+          # 清理 apt 缓存
+          sudo apt-get clean
+          sudo apt-get autoremove -y
+          
+          # 清理 Docker 缓存
+          docker system prune -af --volumes || true
+          
+          echo "清理后磁盘空间:"
+          df -h
+      
       - name: Checkout 代码
         uses: actions/checkout@v2
 
@@ -163,6 +226,12 @@ jobs:
           ls -lah bin/
           ls -lah lib/
           ls -lah configs/
+          
+          # 删除压缩包以节省空间
+          rm -f milvus-build-artifacts.tar.gz
+          
+          echo "解压后磁盘空间:"
+          df -h
 
       - name: 设置 Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -194,6 +263,9 @@ jobs:
           IMAGE_TAG="${{ needs.build-milvus-binary.outputs.image_tag }}"
           OS_NAME="${{ needs.build-milvus-binary.outputs.os_name }}"
           
+          echo "构建前磁盘空间:"
+          df -h
+          
           docker build \
             --network host \
             ${{ steps.build-args.outputs.build_args }} \
@@ -204,6 +276,12 @@ jobs:
           
           echo "FINAL_IMAGE_TAG=${IMAGE_TAG}" >> $GITHUB_ENV
           echo "FINAL_OS_NAME=${OS_NAME}" >> $GITHUB_ENV
+          
+          echo "构建后磁盘空间:"
+          df -h
+          
+          # 清理构建缓存
+          docker builder prune -f || true
 
       - name: 检查镜像信息
         run: |
